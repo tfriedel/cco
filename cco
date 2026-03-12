@@ -26,16 +26,21 @@ warn() { msg "$YELLOW" "⚠" "$1"; }
 error() { msg "$RED" "✗" "$1"; }
 
 # Determine if we're running from installation or development
+# First, resolve symlinks to find the real script location
+_source="${BASH_SOURCE[0]}"
+while [[ -L "$_source" ]]; do
+	_dir="$(cd "$(dirname "$_source")" && pwd)"
+	_source="$(readlink "$_source")"
+	[[ "$_source" != /* ]] && _source="$_dir/$_source"
+done
+_resolved_dir="$(cd "$(dirname "$_source")" && pwd)"
+
 if [[ -f "./Dockerfile" && -f "./cco" ]]; then
 	# Current directory is a cco development environment
 	CCO_INSTALLATION_DIR="$PWD"
 	log "Detected cco development environment, building locally"
-elif [[ -d "$HOME/.local/share/cco/.git" && "$(basename "$(dirname "$0")")" != "cco" ]]; then
-	# Running from symlink, use installation directory
-	CCO_INSTALLATION_DIR="$HOME/.local/share/cco"
 else
-	# Running from development directory
-	CCO_INSTALLATION_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+	CCO_INSTALLATION_DIR="$_resolved_dir"
 fi
 
 IMAGE_NAME="cco:latest"
@@ -270,6 +275,46 @@ handle_add_dir_entry() {
 		exit 1
 		;;
 	esac
+}
+
+# Parse additionalDirectories from .claude/settings.local.json
+# Uses python3 for JSON parsing; silently skips if python3 is unavailable
+load_additional_directories_from_settings() {
+	local settings_file="$PWD/.claude/settings.local.json"
+	if [[ ! -f "$settings_file" ]]; then
+		return
+	fi
+	if ! command -v python3 &>/dev/null; then
+		warn "python3 not found; skipping additionalDirectories from $settings_file"
+		return
+	fi
+	local dirs
+	dirs=$(python3 -c "
+import json, sys
+try:
+    data = json.load(open(sys.argv[1]))
+    for d in data.get('additionalDirectories', []):
+        print(d)
+except Exception:
+    pass
+" "$settings_file" 2>/dev/null) || true
+
+	local dir
+	while IFS= read -r dir; do
+		[[ -z "$dir" ]] && continue
+		local resolved
+		resolved=$(resolve_path "$dir")
+		if [[ -n "$resolved" && -d "$resolved" ]]; then
+			if path_in_array "$resolved" "${deny_paths[@]}"; then
+				log "Skipping settings directory (denied by CLI): $resolved"
+			elif ! path_in_array "$resolved" "${additional_dirs[@]}"; then
+				add_rw_path "$resolved"
+				log "Adding additional directory from settings: $resolved"
+			fi
+		else
+			warn "Skipping additionalDirectories entry (not a directory): $dir"
+		fi
+	done <<< "$dirs"
 }
 
 # Check if Docker is available (only when using Docker backend)
@@ -817,11 +862,67 @@ run_native_sandbox() {
 		return
 	fi
 
+	# AgentFS copy-on-write overlay setup
+	local agentfs_mount_dir=""
+	local agentfs_db=""
+	local agentfs_pid=""
+	if [[ "$agentfs_mode" == true ]]; then
+		if ! command -v agentfs &>/dev/null; then
+			error "agentfs not found. Install it: curl -fsSL https://agentfs.ai/install | bash"
+			exit 1
+		fi
+		if ! command -v fusermount3 &>/dev/null && ! command -v fusermount &>/dev/null; then
+			error "FUSE not available (fusermount3/fusermount not found)"
+			exit 1
+		fi
+
+		# Determine session name
+		if [[ -z "$agentfs_session" ]]; then
+			agentfs_session="cco-$(basename "$current_dir")-$$"
+		fi
+
+		# Init the overlay DB (with project dir as base for copy-on-write)
+		local agentfs_dir="$current_dir/.agentfs"
+		mkdir -p "$agentfs_dir"
+		agentfs_db="$agentfs_dir/${agentfs_session}.db"
+		if [[ ! -f "$agentfs_db" ]]; then
+			agentfs init --base "$current_dir" "$agentfs_session" >/dev/null 2>&1
+			log "Created AgentFS overlay: $agentfs_session"
+		else
+			log "Resuming AgentFS session: $agentfs_session"
+		fi
+
+		# Mount the FUSE overlay
+		agentfs_mount_dir=$(mktemp -d /tmp/cco-agentfs-XXXXXX)
+		agentfs mount "$agentfs_db" "$agentfs_mount_dir" &
+		agentfs_pid=$!
+		# Wait for FUSE to be ready
+		local wait_count=0
+		while ! mountpoint -q "$agentfs_mount_dir" 2>/dev/null; do
+			sleep 0.1
+			wait_count=$((wait_count + 1))
+			if [[ $wait_count -gt 50 ]]; then
+				error "AgentFS FUSE mount timed out"
+				kill "$agentfs_pid" 2>/dev/null || true
+				rmdir "$agentfs_mount_dir" 2>/dev/null || true
+				exit 1
+			fi
+		done
+		log "AgentFS overlay mounted at $agentfs_mount_dir"
+	fi
+
 	# Prepare sandbox access rules
 	local sandbox_rules=()
 
-	# Always allow writes to current project directory
-	sandbox_rules+=("--write" "$current_dir")
+	if [[ "$agentfs_mode" == true && -n "$agentfs_mount_dir" ]]; then
+		# In agentfs mode, we don't add --write for the project dir.
+		# Instead, we pass bwrap args to bind the overlay mount at the project path.
+		# The overlay is writable, so bwrap sees it as a writable dir.
+		sandbox_extra_args+=("--bind" "$agentfs_mount_dir" "$current_dir")
+	else
+		# Always allow writes to current project directory
+		sandbox_rules+=("--write" "$current_dir")
+	fi
 
 	# Add any additional directories specified with --add-dir
 	for dir in "${additional_dirs[@]}"; do
@@ -974,7 +1075,35 @@ run_native_sandbox() {
 	done
 
 	# Execute in sandbox with full environment
-	exec "${cmd[@]}"
+	if [[ "$agentfs_mode" == true && -n "$agentfs_mount_dir" ]]; then
+		# Run (don't exec) so we can clean up the FUSE mount afterward
+		local sandbox_exit=0
+		"${cmd[@]}" || sandbox_exit=$?
+
+		# Unmount AgentFS overlay
+		if mountpoint -q "$agentfs_mount_dir" 2>/dev/null; then
+			if command -v fusermount3 &>/dev/null; then
+				fusermount3 -u "$agentfs_mount_dir" 2>/dev/null || true
+			else
+				fusermount -u "$agentfs_mount_dir" 2>/dev/null || true
+			fi
+		fi
+		# Wait for agentfs process to exit
+		if [[ -n "$agentfs_pid" ]]; then
+			wait "$agentfs_pid" 2>/dev/null || true
+		fi
+		rmdir "$agentfs_mount_dir" 2>/dev/null || true
+
+		# Show what changed
+		log "AgentFS session: $agentfs_session"
+		agentfs diff "$agentfs_db" 2>/dev/null || true
+		log "Resume with: cco --agentfs $agentfs_session"
+		log "Review with: agentfs diff $agentfs_session"
+
+		exit "$sandbox_exit"
+	else
+		exec "${cmd[@]}"
+	fi
 }
 
 # Main run function (Docker backend)
@@ -1630,6 +1759,8 @@ rebuild_image=false
 pull_image=false
 shell_mode=false
 safe_mode=false
+agentfs_mode=false
+agentfs_session=""
 force_bridge_network=false
 allow_external_git_dir=false
 enable_git_worktree_common_dir=true
@@ -1715,6 +1846,16 @@ while [[ $# -gt 0 ]]; do
 	--safe)
 		safe_mode=true
 		shift
+		;;
+	--agentfs)
+		agentfs_mode=true
+		# Optional session name as next arg (if not another flag)
+		if [[ $# -ge 2 && ! "$2" =~ ^- ]]; then
+			agentfs_session="$2"
+			shift 2
+		else
+			shift
+		fi
 		;;
 	--codex-mode)
 		configure_codex_mode_paths
@@ -1814,7 +1955,7 @@ while [[ $# -gt 0 ]]; do
 			while [[ $# -gt 0 ]] && [[ ! "$1" =~ ^- ]]; do
 				# Stop if we hit a known subcommand
 				case "$1" in
-				shell | codex | droid | opencode | pi | gemini | self-update | cleanup | info | backup-creds | restore-creds | pull | rebuild)
+				shell | codex | droid | opencode | pi | gemini | self-update | cleanup | info | backup-creds | restore-creds | pull | rebuild | agentfs-apply | agentfs-diff | agentfs-list)
 					# This is a subcommand, not a directory
 					break
 					;;
@@ -1889,6 +2030,133 @@ if [[ $# -gt 0 ]]; then
 		# All remaining arguments are passed to gemini
 		claude_args=("$@")
 		;;
+	agentfs-apply)
+		# Apply changes from an AgentFS overlay session back to the real filesystem
+		shift
+		_af_session="${1:-}"
+		if [[ -z "$_af_session" ]]; then
+			error "Usage: cco agentfs-apply <SESSION>"
+			error "Available sessions:"
+			ls .agentfs/*.db 2>/dev/null | sed 's|.agentfs/||;s|\.db$||' | while read -r s; do
+				echo "  $s" >&2
+			done
+			exit 1
+		fi
+
+		_af_db=".agentfs/${_af_session}.db"
+		if [[ ! -f "$_af_db" ]]; then
+			error "Session not found: $_af_db"
+			exit 1
+		fi
+
+		# Show what would be applied
+		log "Changes in session '$_af_session':"
+		_af_diff=$(agentfs diff "$_af_db" 2>&1 | grep -E '^[MAD] ')
+		if [[ -z "$_af_diff" ]]; then
+			log "No changes to apply"
+			exit 0
+		fi
+		echo "$_af_diff" >&2
+
+		# Prompt for confirmation
+		echo "" >&2
+		read -r -p "Apply these changes to $(pwd)? [y/N] " confirm
+		if [[ "$confirm" != [yY] ]]; then
+			log "Aborted"
+			exit 0
+		fi
+
+		# Mount overlay and copy changed files
+		_af_mount=$(mktemp -d /tmp/cco-agentfs-apply-XXXXXX)
+		agentfs mount "$_af_db" "$_af_mount" &
+		_af_pid=$!
+		_af_wait=0
+		while ! mountpoint -q "$_af_mount" 2>/dev/null; do
+			sleep 0.1
+			_af_wait=$((_af_wait + 1))
+			if [[ $_af_wait -gt 50 ]]; then
+				error "AgentFS mount timed out"
+				kill "$_af_pid" 2>/dev/null || true
+				rmdir "$_af_mount" 2>/dev/null || true
+				exit 1
+			fi
+		done
+
+		# Apply each change
+		while IFS=' ' read -r action type path; do
+			_af_src="$_af_mount$path"
+			_af_dest="$(pwd)$path"
+			case "$action" in
+			A | M)
+				if [[ "$type" == "d" ]]; then
+					mkdir -p "$_af_dest"
+					log "  mkdir $path"
+				else
+					mkdir -p "$(dirname "$_af_dest")"
+					cp "$_af_src" "$_af_dest"
+					log "  applied $path"
+				fi
+				;;
+			D)
+				if [[ -e "$_af_dest" ]]; then
+					rm -rf "$_af_dest"
+					log "  deleted $path"
+				fi
+				;;
+			esac
+		done <<<"$_af_diff"
+
+		# Unmount
+		if command -v fusermount3 &>/dev/null; then
+			fusermount3 -u "$_af_mount" 2>/dev/null || true
+		else
+			fusermount -u "$_af_mount" 2>/dev/null || true
+		fi
+		wait "$_af_pid" 2>/dev/null || true
+		rmdir "$_af_mount" 2>/dev/null || true
+
+		log "Applied changes from session '$_af_session'"
+		exit 0
+		;;
+	agentfs-diff)
+		# Show diff for an AgentFS session
+		shift
+		_af_session="${1:-}"
+		if [[ -z "$_af_session" ]]; then
+			error "Usage: cco agentfs-diff <SESSION>"
+			exit 1
+		fi
+		_af_db=".agentfs/${_af_session}.db"
+		if [[ ! -f "$_af_db" ]]; then
+			error "Session not found: $_af_db"
+			exit 1
+		fi
+		agentfs diff "$_af_db"
+		exit 0
+		;;
+	agentfs-list)
+		# List AgentFS sessions (only overlay DBs that have a base)
+		if [[ -d .agentfs ]]; then
+			_af_found=false
+			for db in .agentfs/*.db; do
+				[[ -f "$db" ]] || continue
+				# Only show overlay DBs (those with a base directory)
+				_af_base=$(agentfs diff "$db" 2>&1 | grep '^Base: ' | sed 's/^Base: //')
+				if [[ -n "$_af_base" ]]; then
+					_af_found=true
+					_af_name=$(basename "$db" .db)
+					_af_changes=$(agentfs diff "$db" 2>/dev/null | grep -cE '^[MAD] ') || _af_changes=0
+					echo "$_af_name ($_af_changes changes)"
+				fi
+			done
+			if [[ "$_af_found" == false ]]; then
+				log "No AgentFS overlay sessions found"
+			fi
+		else
+			log "No AgentFS sessions found"
+		fi
+		exit 0
+		;;
 	cleanup)
 		log "Cleaning up cco containers..."
 		containers=$(docker ps -a --format "{{.Names}}" | grep "^cco-" || true)
@@ -1948,6 +2216,9 @@ if [[ $# -gt 0 ]]; then
 		echo "  opencode [args...]  Run OpenCode in sandbox"
 		echo "  pi [args...]        Run Pi coding agent in sandbox"
 		echo "  gemini [args...]    Run Google Gemini CLI in sandbox"
+		echo "  agentfs-list        List AgentFS overlay sessions"
+		echo "  agentfs-diff SES    Show changes in an AgentFS session"
+		echo "  agentfs-apply SES   Apply AgentFS overlay changes to real filesystem"
 		echo "  cleanup             Remove all cco containers"
 		echo "  info                Show system info and readiness"
 		echo "  pull                Pull latest pre-built image"
@@ -1963,6 +2234,9 @@ if [[ $# -gt 0 ]]; then
 		echo "  --packages, -p PKG    Install additional apt packages"
 		echo "  --backend TYPE        Force sandbox backend (auto, native, docker)"
 		echo "  --safe                Hide home dir except working dir (native only)"
+		echo "  --agentfs [SESSION]   Copy-on-write overlay via AgentFS (native only, requires agentfs)"
+		echo "                        All writes go to a SQLite DB, real files stay untouched"
+		echo "                        Use 'agentfs diff SESSION' to review changes after exit"
 		echo "  --codex-mode          Add Docker runtime flags for Codex compatibility"
 		echo "  --allow-external-git-dir"
 		echo "                        Trust and mount git common dirs outside normal layouts"
@@ -2084,6 +2358,9 @@ main() {
 			log "Using existing cco image"
 		fi
 	fi
+
+	# Load additionalDirectories from .claude/settings.local.json
+	load_additional_directories_from_settings
 
 	# If inside a git worktree, the object store lives in the main repo's
 	# .git directory, not the worktree. Add it as an additional dir so both
