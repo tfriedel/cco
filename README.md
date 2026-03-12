@@ -210,6 +210,11 @@ cco cleanup
 # Safe mode (native sandbox): hide $HOME for stronger isolation (experimental)
 cco --safe
 
+# Copy-on-write overlay: all writes go to SQLite, real files untouched
+cco --agentfs "implement feature X"
+cco --agentfs my-session "work on feature"   # Named session
+cco --agentfs my-session --resume             # Resume session
+
 # Share directories read-only or hide them
 cco --add-dir ~/configs:ro
 cco --allow-readonly ~/.ssh
@@ -220,6 +225,7 @@ cco --deny-path ~/Downloads
 - `--force-docker-bridge-network` (Docker only): Force bridge networking instead of host networking. By default cco uses `--network=host` when available (Linux, OrbStack). Use this if you need port isolation or want explicit `-p` port forwarding.
 - `--allow-oauth-refresh` (experimental): Gives the container write access to your Claude credentials so refreshed tokens sync back to the host. Malicious prompts could corrupt or replace those credentials.
 - `--safe` (native only, experimental): **Provides stronger filesystem isolation** by hiding your entire `$HOME` directory from Claude. Only the project directory and explicitly shared paths remain visible. **Trade-off**: Increased security but may cause some tools to fail if they need access to configuration files in `$HOME`. Use `--allow-readonly` to selectively expose needed paths.
+- `--agentfs [SESSION]` (native only, experimental): **Copy-on-write filesystem overlay** powered by [AgentFS](https://github.com/tursodatabase/agentfs). All file writes go to a SQLite database while real project files stay untouched. Sessions persist and can be resumed. Requires `agentfs` CLI and FUSE support. See [AgentFS Overlay Mode](#agentfs-overlay-mode) for details.
 - `--allow-readonly PATH`: Share extra files or directories read-only inside the sandbox.
 - `--deny-path PATH`: Deny read/list/write access to a path so it is fully inaccessible to Claude.
 
@@ -341,6 +347,51 @@ cco --add-dir ~/.codex --command "codex --dangerously-bypass-approvals-and-sandb
 ```
 
 Security note: `--dangerously-bypass-approvals-and-sandbox` applies to Codex’s internal permission checks, not to `cco`. The `cco` sandbox still constrains filesystem access to your project and explicitly mounted paths. Network access remains unrestricted by design.
+
+### AgentFS Overlay Mode
+
+`cco --agentfs` adds a **copy-on-write filesystem overlay** to the native sandbox using [AgentFS](https://github.com/tursodatabase/agentfs). All file writes go to a SQLite database while your real project files stay untouched. This is useful for:
+
+- **Safe experimentation**: Let Claude modify files freely without risk to your codebase
+- **Multi-agent workflows**: Multiple agents work on the same repo with separate overlay sessions
+- **Reviewable changes**: Inspect what an agent changed before applying to real files
+
+**Requirements:**
+- Native sandbox mode (Linux with bubblewrap)
+- AgentFS CLI: `curl -fsSL https://agentfs.ai/install | bash`
+- FUSE support (`fusermount3`)
+
+**How it works:**
+1. AgentFS creates a FUSE overlay with your project dir as a read-only base
+2. The overlay is mounted *before* entering the bwrap sandbox
+3. bwrap bind-mounts the overlay at the project path — all security (cap-drop, seccomp, device blocking) is preserved
+4. All writes go to `.agentfs/<session>.db`, real files are never modified
+
+**Usage:**
+
+```bash
+# Start a session (auto-generated or named)
+cco --agentfs "refactor the auth module"
+cco --agentfs my-feature "implement feature X"
+
+# Resume a previous session
+cco --agentfs my-feature --resume
+
+# Multiple agents on the same repo
+cco --agentfs agent-a "work on feature A"
+cco --agentfs agent-b "work on feature B"
+
+# List sessions and their change counts
+cco agentfs-list
+
+# Review what changed
+cco agentfs-diff my-feature
+
+# Apply overlay changes to the real filesystem
+cco agentfs-apply my-feature
+```
+
+`agentfs-apply` mounts the overlay, copies changed files to the real filesystem, and prompts for confirmation before applying. Directories, modified files, and new files are all handled. Deleted files are removed from the real filesystem.
 
 ## MCP Server Support
 
